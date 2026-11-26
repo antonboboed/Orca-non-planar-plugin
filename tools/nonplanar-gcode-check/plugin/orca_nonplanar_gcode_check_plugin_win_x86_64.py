@@ -37,6 +37,8 @@ SETTINGS (JSON in the plugin config)
     fail_on_error  bool   default true   stop the export on errors; false = log only
 
 INSTALL (not yet verified on Windows Server 2019 with P1S)
+    The file name must end with a supported OS and arch target before .py, for example
+    orca_nonplanar_gcode_check_plugin_win_x86_64.py. A name without the target is rejected.
     Plugins window in OrcaSlicer, install a local package from this file, enable it.
     The exact button name can differ between builds.
 

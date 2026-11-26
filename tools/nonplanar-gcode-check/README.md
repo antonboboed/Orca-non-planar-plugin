@@ -48,7 +48,7 @@ python3 -m unittest -v test_gcode_check.py           # тесты
 
 ## Плагин OrcaSlicer 2.5.2
 
-Файл `plugin/orca_nonplanar_gcode_check_plugin.py` собирается из `gcode_check.py` скриптом:
+Файл `plugin/orca_nonplanar_gcode_check_plugin_win_x86_64.py` собирается из `gcode_check.py` скриптом:
 
 ```bash
 python3 plugin/build_plugin.py
@@ -63,7 +63,7 @@ G-code и **не меняет его**. При ошибках (`SLOPE`, `COLLISI
 - `fail_on_error` (по умолчанию `true`; при `false` ошибки только выводятся в лог).
 
 Установка (не проверено на Windows Server 2019 и P1S): откройте окно **Plugins** в OrcaSlicer,
-установите локальный файл `orca_nonplanar_gcode_check_plugin.py`, включите плагин. Точное название
+установите локальный файл `orca_nonplanar_gcode_check_plugin_win_x86_64.py`, включите плагин. Имя файла обязательно заканчивается на цель платформы перед `.py` (`_win_x86_64`): без неё загрузка отклоняется с ошибкой «Plugin filenames must end with a supported OS and arch target». Точное название
 кнопки может отличаться в вашей сборке.
 
 Проверено только заглушкой модуля `orca` в песочнице (проверка логики и кодов возврата). Реальный

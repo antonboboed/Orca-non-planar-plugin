@@ -14,7 +14,7 @@ import types
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PLUGIN = os.path.join(HERE, "plugin", "orca_nonplanar_gcode_check_plugin.py")
+PLUGIN = os.path.join(HERE, "plugin", "orca_nonplanar_gcode_check_plugin_win_x86_64.py")
 
 
 def _make_orca_stub():

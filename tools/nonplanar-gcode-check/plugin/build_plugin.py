@@ -2,7 +2,7 @@
 """Build the single-file OrcaSlicer plugin from gcode_check.py.
 
 The plugin loader takes one entry file, so the checker code is copied into it here.
-Run: python3 plugin/build_plugin.py  ->  plugin/orca_nonplanar_gcode_check_plugin.py
+Run: python3 plugin/build_plugin.py  ->  plugin/orca_nonplanar_gcode_check_plugin_win_x86_64.py
 """
 import os
 
@@ -26,7 +26,7 @@ head, rest = header.split("import json\n", 1)
 out = head + "import json\n" + "\n# ---- checker (generated from gcode_check.py; edit that file) ----\n" + body.rstrip() + "\n\n" \
     + "import orca" + rest.split("import orca", 1)[1]
 
-target = os.path.join(HERE, "orca_nonplanar_gcode_check_plugin.py")
+target = os.path.join(HERE, "orca_nonplanar_gcode_check_plugin_win_x86_64.py")
 with open(target, "w", encoding="utf-8") as f:
     f.write(out)
 print("wrote", target)
