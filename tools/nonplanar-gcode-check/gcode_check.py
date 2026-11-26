@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Independent checker for nonplanar G-code (draft, standard library only).
+
+What it checks, from the G-code alone:
+  * slope of every move (|dz| / horizontal length) against a limit (default 12 degrees);
+  * Z range, arc moves (G2/G3, not analysed), homing (G28, Z becomes unknown);
+  * extrusion made while Z changes: counted as nonplanar extrusion, reported as info;
+  * nozzle collisions with already deposited material for the TIP and the CONE of the
+    hotend model. The model values are taken from the nonplanar reference patch
+    (orca-nonplanar.patch, NonplanarClearanceModel: "simplified A1 mini hotend").
+
+What it does NOT check (reported as warnings when deposited material could be there):
+  * the heater block and toolhead body, which start 2.5 mm above the nozzle tip;
+  * the real hotend of the printer in use (the model is NOT validated for the P1S);
+  * the physical reality of the printer (motion limits, backlash, bed deformation).
+
+A clean report is NOT a safety certificate. Check the sliced G-code visually as well.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+# ---- Hotend model (reference patch, NonplanarClearanceModel; A1 mini, not P1S) ----
+TIP_RADIUS = 0.5504
+CONTACT_ALLOWANCE = 0.12          # material up to this height above the tip is allowed
+CONE_BOTTOM, CONE_BOTTOM_R = 0.15, 0.613
+CONE_TOP, CONE_TOP_R = 2.5, 1.5979
+CONE_INFLATION = 0.02
+CONE_SLICES = 24
+BEAD_HALF_WIDTH = 0.2
+COLLISION_MARGIN = 0.02
+BLOCK_START = 2.5                 # heater block (not modelled here) starts above this
+GRID = 0.25                       # height-map cell size, mm
+
+
+def build_rings() -> List[Tuple[float, float]]:
+    """(bottom height above tip, radius) of each hotend component slice."""
+    rings = [(CONTACT_ALLOWANCE, TIP_RADIUS)]
+    step = (CONE_TOP - CONE_BOTTOM) / CONE_SLICES
+    for k in range(CONE_SLICES):
+        low = CONE_BOTTOM + k * step
+        high = low + step
+        r = CONE_BOTTOM_R + (CONE_TOP_R - CONE_BOTTOM_R) * (high - CONE_BOTTOM) / (CONE_TOP - CONE_BOTTOM)
+        rings.append((low - CONE_INFLATION, r + CONE_INFLATION))
+    return rings
+
+
+RINGS = build_rings()
+
+# A deposited bead is stored by its centreline cells. The bead half width is added once,
+# in the collision test (as in the reference: material footprint = bead centreline + half width).
+STENCIL = [(0, 0)]
+
+
+def obstruction_radius(dz: float) -> float:
+    """Largest component radius that is lower than `dz` above the tip (0 if none)."""
+    radius = 0.0
+    for bottom, r in RINGS:
+        if bottom < dz:
+            radius = max(radius, r)
+    return radius
+
+
+# ---- G-code reading ----
+WORD_RE = re.compile(r"([A-Za-z])\s*([-+]?(?:\d+\.?\d*|\.\d+))")
+
+
+@dataclass
+class Issue:
+    level: str          # "error", "warning" or "info"
+    code: str
+    line: int
+    message: str
+
+
+@dataclass
+class Report:
+    issues: List[Issue] = field(default_factory=list)
+    counts: Dict[str, int] = field(default_factory=dict)
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
+    max_slope_deg: float = 0.0
+    unchecked_high_samples: int = 0
+
+    def add(self, level: str, code: str, line: int, message: str) -> None:
+        self.issues.append(Issue(level, code, line, message))
+
+    def count(self, key: str, n: int = 1) -> None:
+        self.counts[key] = self.counts.get(key, 0) + n
+
+    @property
+    def errors(self) -> int:
+        return sum(1 for i in self.issues if i.level == "error")
+
+
+class Checker:
+    def __init__(self, max_angle_deg: float = 12.0, step: float = GRID / 2, max_issues: int = 200):
+        self.max_slope = math.tan(math.radians(max_angle_deg))
+        self.max_angle_deg = max_angle_deg
+        self.step = step
+        self.max_issues = max_issues
+        self.report = Report()
+        # Absolute state
+        self.pos = [0.0, 0.0, 0.0]           # x, y, z; z is None-like when unknown
+        self.z_known = True
+        self.e_pos = 0.0
+        self.abs_xyz = True
+        self.abs_e = True
+        self.feedrate_seen = False
+        self.current_type = ""
+        # Height map of deposited material: (ix, iy) -> highest z of material in the cell
+        self.heights: Dict[Tuple[int, int], float] = {}
+        self.stamped: Dict[Tuple[int, int], float] = {}   # path cells already stamped, with their z
+        self.max_deposited_z = -math.inf
+
+    # -- helpers --
+    def _issue(self, level: str, code: str, line: int, msg: str) -> None:
+        if level == "error" or len(self.report.issues) < self.max_issues:
+            self.report.add(level, code, line, msg)
+
+    @staticmethod
+    def _cell(x: float, y: float) -> Tuple[int, int]:
+        return (round(x / GRID), round(y / GRID))
+
+    def _deposit(self, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> None:
+        """Mark the centreline cells of a bead from (x0, y0, z0) to (x1, y1, z1)."""
+        length = math.hypot(x1 - x0, y1 - y0)
+        n = max(1, int(math.ceil(length / (GRID / 2))))
+        heights = self.heights
+        top = -math.inf
+        for k in range(n + 1):
+            t = k / n
+            # Height of the bead at this point: the nozzle Z here, not the segment maximum.
+            zk = z0 + (z1 - z0) * t
+            cx, cy = self._cell(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+            if self.stamped.get((cx, cy), -math.inf) >= zk:
+                continue
+            self.stamped[(cx, cy)] = zk
+            for dx, dy in STENCIL:
+                key = (cx + dx, cy + dy)
+                if zk > heights.get(key, -math.inf):
+                    heights[key] = zk
+            top = max(top, zk)
+        if top > self.max_deposited_z:
+            self.max_deposited_z = top
+
+    def _check_clearance(self, x: float, y: float, z: float, line: int) -> bool:
+        """Nozzle at (x, y, z) against deposited material (tip and cone only). True if it collides."""
+        if self.max_deposited_z <= z + CONTACT_ALLOWANCE:
+            return False
+        # Search radius in cells: tip/cone components plus the bead width of the material cell
+        r_cells = int(math.ceil((max(r for _, r in RINGS) + COLLISION_MARGIN + BEAD_HALF_WIDTH + GRID) / GRID))
+        cx, cy = self._cell(x, y)
+        for ix in range(cx - r_cells, cx + r_cells + 1):
+            for iy in range(cy - r_cells, cy + r_cells + 1):
+                zc = self.heights.get((ix, iy))
+                if zc is None:
+                    continue
+                dz = zc - z
+                if dz <= CONTACT_ALLOWANCE:
+                    continue
+                if dz > BLOCK_START:
+                    # Heater block / body territory: not modelled. Count and warn later.
+                    self.report.unchecked_high_samples += 1
+                    continue
+                d = math.hypot(ix * GRID - x, iy * GRID - y)
+                limit = obstruction_radius(dz) + COLLISION_MARGIN + BEAD_HALF_WIDTH
+                if d <= limit:
+                    self.report.count("collision")
+                    self._issue("error", "COLLISION", line,
+                                f"nozzle at ({x:.2f}, {y:.2f}, z={z:.3f}) is {d:.2f} mm from material at "
+                                f"z={zc:.3f} (height above tip {dz:.3f} mm, tip/cone reach {limit:.2f} mm)")
+                    return True
+        return False
+
+    def _track_z(self, z: float, line: int) -> None:
+        if self.report.z_min is None or z < self.report.z_min:
+            self.report.z_min = z
+        if self.report.z_max is None or z > self.report.z_max:
+            self.report.z_max = z
+        # Negative Z is not an error by itself: Bambu firmware touches the nozzle on an exposed
+        # steel area below Z=0 for calibration. Extrusion below the bed is checked in _move.
+        if z < -1e-6:
+            self.report.count("z_below_bed_moves")
+
+    # -- main loop --
+    def run(self, lines) -> Report:
+        for lineno, raw in enumerate(lines, start=1):
+            self._line(raw.rstrip("\n"), lineno)
+        if self.report.unchecked_high_samples:
+            self.report.add("warning", "UNCHECKED_HIGH", 0,
+                            f"{self.report.unchecked_high_samples} sample(s) had deposited material more than "
+                            f"{BLOCK_START} mm above the nozzle (heater block / body zone, NOT checked). "
+                            "Verify these places manually.")
+        return self.report
+
+    def _line(self, raw: str, lineno: int) -> None:
+        if ";" in raw:
+            code, comment = raw.split(";", 1)
+            m = re.match(r"\s*TYPE:(.*)", comment)
+            if m:
+                self.current_type = m.group(1).strip()[:40]
+        else:
+            code = raw
+        code = re.sub(r"\([^)]*\)", "", code).strip()
+        if not code:
+            return
+        words = code.split()
+        cmd = words[0].upper()
+        if cmd in ("G0", "G00", "G1", "G01"):
+            self._move(code, lineno)
+        elif cmd in ("G2", "G02", "G3", "G03"):
+            self.report.count("arc_moves")
+            self._arc(code, cmd in ("G2", "G02"), lineno)
+        elif cmd == "G90":
+            self.abs_xyz = True
+        elif cmd == "G91":
+            self.abs_xyz = False
+        elif cmd == "M82":
+            self.abs_e = True
+        elif cmd == "M83":
+            self.abs_e = False
+        elif cmd == "G92":
+            self._set_position(code)
+        elif cmd in ("G20",):
+            self._issue("error", "UNITS", lineno, "G20 (inches) is not supported")
+        elif cmd == "G28":
+            self.z_known = False
+            self.report.count("homing")
+            self._issue("warning", "HOME", lineno, "G28 homing: Z position unknown until the next absolute Z word")
+        elif cmd.startswith("G") and cmd not in ("G21",):
+            self.report.count("other_g")
+
+    def _values(self, code: str) -> Dict[str, float]:
+        vals: Dict[str, float] = {}
+        for letter, num in WORD_RE.findall(code):
+            vals[letter.upper()] = float(num)
+        return vals
+
+    def _set_position(self, code: str) -> None:
+        v = self._values(code)
+        if "X" in v:
+            self.pos[0] = v["X"]
+        if "Y" in v:
+            self.pos[1] = v["Y"]
+        if "Z" in v:
+            self.pos[2] = v["Z"]
+            self.z_known = True
+        if "E" in v:
+            self.e_pos = v["E"]
+
+    def _update_position(self, code: str) -> None:
+        v = self._values(code)
+        if self.abs_xyz:
+            for i, letter in enumerate("XYZ"):
+                if letter in v:
+                    self.pos[i] = v[letter]
+            if "Z" in v:
+                self.z_known = True
+        else:
+            for i, letter in enumerate("XYZ"):
+                if letter in v:
+                    self.pos[i] += v[letter]
+        if "E" in v:
+            self.e_pos = v["E"] if self.abs_e else self.e_pos + v["E"]
+
+    def _arc(self, code: str, clockwise: bool, lineno: int) -> None:
+        """Split a G2/G3 arc into short chords and check each chord like a G1 move."""
+        v = self._values(code)
+        x0, y0, z0 = self.pos
+        e0 = self.e_pos
+        xe = v.get("X", x0) if self.abs_xyz else x0 + v.get("X", 0.0)
+        ye = v.get("Y", y0) if self.abs_xyz else y0 + v.get("Y", 0.0)
+        ze = v.get("Z", z0) if self.abs_xyz else z0 + v.get("Z", 0.0)
+        if "I" in v or "J" in v:
+            cx, cy = x0 + v.get("I", 0.0), y0 + v.get("J", 0.0)   # IJ offsets are always relative
+        elif "R" in v:
+            # R form: centre on the perpendicular bisector; positive R means the short arc.
+            mx, my = (x0 + xe) / 2, (y0 + ye) / 2
+            d = math.hypot(xe - x0, ye - y0)
+            h = math.sqrt(max(0.0, v["R"] ** 2 - (d / 2) ** 2))
+            ux, uy = (-(ye - y0) / d, (xe - x0) / d) if d > 1e-12 else (0.0, 0.0)
+            sign = -1.0 if clockwise else 1.0
+            if v["R"] < 0:
+                sign = -sign
+            cx, cy = mx + sign * ux * h, my + sign * uy * h
+        else:
+            self._issue("warning", "ARC", lineno, "arc without I/J/R: not analysed")
+            self.pos = [xe, ye, ze]
+            return
+        radius = math.hypot(x0 - cx, y0 - cy)
+        if radius < 1e-9:
+            self.pos = [xe, ye, ze]
+            return
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        a1 = math.atan2(ye - cy, xe - cx)
+        if math.hypot(xe - x0, ye - y0) < 1e-9:
+            sweep = 2 * math.pi                         # full circle
+        elif clockwise:
+            sweep = (a0 - a1) % (2 * math.pi)
+        else:
+            sweep = (a1 - a0) % (2 * math.pi)
+        sign = -1.0 if clockwise else 1.0
+        n = max(1, int(math.ceil(radius * sweep / 0.2)))
+        if "E" in v:
+            ex_abs = v["E"] if self.abs_e else e0 + v["E"]
+        else:
+            ex_abs = None
+        p_prev = (x0, y0, z0, e0)
+        for k in range(1, n + 1):
+            t = k / n
+            ang = a0 + sign * sweep * t
+            x = cx + radius * math.cos(ang)
+            y = cy + radius * math.sin(ang)
+            z = z0 + (ze - z0) * t
+            e = e0 if ex_abs is None else e0 + (ex_abs - e0) * t
+            if k == n:
+                x, y, z = xe, ye, ze
+            self._segment(p_prev[0], p_prev[1], p_prev[2], p_prev[3], x, y, z, e, lineno)
+            p_prev = (x, y, z, e)
+        self.pos = [xe, ye, ze]
+        self.e_pos = ex_abs if ex_abs is not None else e0
+
+    def _move(self, code: str, lineno: int) -> None:
+        v = self._values(code)
+        if "F" in v:
+            self.feedrate_seen = True
+        x0, y0, z0 = self.pos
+        e0 = self.e_pos
+        new = list(self.pos)
+        if self.abs_xyz:
+            for i, letter in enumerate("XYZ"):
+                if letter in v:
+                    new[i] = v[letter]
+        else:
+            for i, letter in enumerate("XYZ"):
+                if letter in v:
+                    new[i] += v[letter]
+        e1 = e0
+        if "E" in v:
+            e1 = v["E"] if self.abs_e else e0 + v["E"]
+        if "Z" in v:
+            self.z_known = True
+        self._segment(x0, y0, z0, e0, new[0], new[1], new[2], e1, lineno)
+
+    def _segment(self, x0, y0, z0, e0, x1, y1, z1, e1, lineno: int) -> None:
+        """One straight move from (x0, y0, z0, e0) to (x1, y1, z1, e1)."""
+        self.pos = [x1, y1, z1]
+        self.e_pos = e1
+        self._track_z(z1, lineno)
+        if not self.z_known:
+            return
+
+        dxy = math.hypot(x1 - x0, y1 - y0)
+        dz = z1 - z0
+        extruding = (e1 - e0) > 1e-9
+        kind = "extrude" if extruding else "travel"
+        self.report.count(f"moves_{kind}")
+
+        if abs(dz) > 1e-9:
+            if dxy < 1e-6:
+                self.report.count("vertical_moves")
+            else:
+                slope = abs(dz) / dxy
+                angle = math.degrees(math.atan(slope))
+                self.report.max_slope_deg = max(self.report.max_slope_deg, angle)
+                # Extrusion slopes are errors in both directions. Travel is checked only when the
+                # nozzle goes DOWN (a Z-hop up is safe; collisions are checked separately).
+                if slope > self.max_slope + 1e-12 and dxy >= 0.5 and (extruding or dz < 0):
+                    level = "error" if extruding else "warning"
+                    self._issue(level, "SLOPE", lineno,
+                                f"{kind} move at {angle:.2f}deg (limit {self.max_angle_deg:g}deg), "
+                                f"dz={dz:.3f} over {dxy:.3f} mm, type '{self.current_type}'")
+                if extruding:
+                    self.report.count("nonplanar_extrusion_moves")
+
+        # Collision: sample the move from start to end.
+        samples = max(1, int(math.ceil(dxy / self.step)), int(math.ceil(abs(dz) / self.step)))
+        for k in range(samples + 1):
+            t = k / samples
+            if self._check_clearance(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, z0 + (z1 - z0) * t, lineno):
+                break   # one collision per move is enough to fail the check
+        if extruding and dxy > 1e-9:
+            self._deposit(x0, y0, z0, x1, y1, z1)
+        if extruding and min(z0, z1) < -1e-6:
+            self._issue("error", "Z_NEGATIVE", lineno, f"extrusion below the bed (Z={min(z0, z1):.3f})")
+
+
+def format_report(path: str, report: Report, max_angle: float) -> str:
+    out = []
+    out.append(f"File: {path}")
+    out.append(f"Slope limit: {max_angle:g} deg; hotend model: tip + cone (A1 mini reference values, NOT P1S-validated)")
+    out.append("Counts: " + (", ".join(f"{k}={v}" for k, v in sorted(report.counts.items())) or "none"))
+    if report.z_min is not None:
+        out.append(f"Z range: {report.z_min:.3f} .. {report.z_max:.3f} mm")
+    out.append(f"Max move slope (moves with dxy >= 0.5 mm): {report.max_slope_deg:.2f} deg")
+    errors = [i for i in report.issues if i.level == "error"]
+    warnings = [i for i in report.issues if i.level == "warning"]
+    out.append(f"Errors: {len(errors)}, warnings: {len(warnings)}")
+    for issue in report.issues:
+        loc = f"line {issue.line}" if issue.line else "global"
+        out.append(f"  [{issue.level.upper()}] {issue.code} ({loc}): {issue.message}")
+    if report.errors:
+        out.append("RESULT: FAILED - do NOT print this G-code until the errors are resolved.")
+    else:
+        out.append("RESULT: no errors found by this checker. This is NOT a safety certificate.")
+    return "\n".join(out)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    parser.add_argument("gcode", help="G-code file to check")
+    parser.add_argument("--max-angle", type=float, default=12.0, help="maximum move slope in degrees (default 12)")
+    parser.add_argument("--step", type=float, default=GRID / 2, help="collision sampling step in mm (default 0.125)")
+    args = parser.parse_args(argv)
+    checker = Checker(max_angle_deg=args.max_angle, step=args.step)
+    with open(args.gcode, "r", encoding="utf-8", errors="replace") as fh:
+        report = checker.run(fh)
+    print(format_report(args.gcode, report, args.max_angle))
+    return 1 if report.errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
