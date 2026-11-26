@@ -29,9 +29,15 @@ class PlanarTests(unittest.TestCase):
         self.assertEqual(codes(r), [])
         self.assertEqual(r.counts.get("nonplanar_extrusion_moves", 0), 0)
 
-    def test_negative_z_is_error(self):
-        r = run(["G90", "G1 Z-0.1"])
+    def test_extrusion_below_bed_is_error(self):
+        r = run(["G90", "M83", "G1 X0 Y0 Z-0.1", "G1 X5 Y0 E1"])
         self.assertIn("Z_NEGATIVE", codes(r))
+
+    def test_calibration_touch_below_bed_is_not_error(self):
+        # Bambu startup: nozzle pressed on the exposed steel below Z=0 with no extrusion.
+        r = run(["G90", "M83", "G1 X0 Y0 Z0.5", "G1 X128 Y261 Z-1.5", "G1 X125 Y259 Z-1.01"])
+        self.assertNotIn("Z_NEGATIVE", codes(r))
+        self.assertEqual(codes(r), [])
 
 
 class SlopeTests(unittest.TestCase):
@@ -92,10 +98,42 @@ class CollisionTests(unittest.TestCase):
         self.assertIn("UNCHECKED_HIGH", codes(r, level="warning"))
 
 
+class RegressionTests(unittest.TestCase):
+    def test_own_bead_is_not_material_for_next_move(self):
+        # Nonplanar bead descending along its own path: the nozzle is always at the bead's end.
+        g = ["G90", "M83", "G1 X0 Y0 Z0.5", "G1 X1 Y0 Z0.45 E0.1", "G1 X2 Y0 Z0.40 E0.2",
+             "G1 X3 Y0 Z0.35 E0.3", "G1 X4 Y0 Z0.30 E0.4"]
+        r = run(g)
+        self.assertNotIn("COLLISION", codes(r))
+
+    def test_travel_slope_down_is_warning_not_error(self):
+        r = run(["G90", "G1 X0 Y0 Z2.0", "G1 X3 Y0 Z1.0"])
+        self.assertNotIn("SLOPE", codes(r))
+        self.assertIn("SLOPE", codes(r, level="warning"))
+
+    def test_z_hop_up_is_not_slope_warning(self):
+        r = run(["G90", "G1 X0 Y0 Z1.2", "G1 X0.5 Y0 Z1.6 F30000"])
+        self.assertEqual(codes(r, level="warning"), [])
+
+
 class HomingAndArcTests(unittest.TestCase):
-    def test_arc_is_warning(self):
-        r = run(["G90", "G1 X0 Y0 Z1", "G2 X5 Y0 I2.5 J0 E1"])
-        self.assertIn("ARC", codes(r, level="warning"))
+    def test_arc_is_analysed_not_skipped(self):
+        r = run(["G90", "M83", "G1 X0 Y0 Z1", "G2 X5 Y0 I2.5 J0 E1"])
+        self.assertNotIn("ARC", codes(r, level="warning"))
+        self.assertEqual(r.counts.get("arc_moves"), 1)
+        self.assertGreater(r.counts.get("moves_extrude", 0), 1)   # split into chords
+
+    def test_arc_extrusion_deposits_material(self):
+        # A fully extruded arc at Z=5 must leave material that blocks a nozzle passing underneath.
+        g = ["G90", "M83", "G1 X0 Y0 Z5", "G2 X10 Y0 I5 J0 E5", "G1 Z8", "G1 X5 Y20",
+             "G1 Z4.5", "G1 X5 Y0.2"]
+        r = run(g)
+        self.assertIn("COLLISION", codes(r))
+
+    def test_arc_clear_of_material_is_ok(self):
+        g = ["G90", "M83", "G1 X0 Y0 Z1", "G2 X10 Y0 I5 J0 E5", "G1 Z1.2 F600", "G1 X20 Y20"]
+        r = run(g)
+        self.assertNotIn("COLLISION", codes(r))
 
     def test_homing_is_warning(self):
         r = run(["G28", "G1 Z1 F100"])

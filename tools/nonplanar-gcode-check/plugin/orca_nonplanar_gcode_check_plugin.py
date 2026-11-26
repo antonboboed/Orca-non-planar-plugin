@@ -54,11 +54,9 @@ def build_rings() -> List[Tuple[float, float]]:
 
 RINGS = build_rings()
 
-# Cell offsets covered by one bead around a path cell (bead half width plus half a cell).
-_STENCIL_R = int(math.ceil((BEAD_HALF_WIDTH + GRID / 2) / GRID))
-STENCIL = [(dx, dy) for dx in range(-_STENCIL_R, _STENCIL_R + 1)
-           for dy in range(-_STENCIL_R, _STENCIL_R + 1)
-           if math.hypot(dx * GRID, dy * GRID) <= BEAD_HALF_WIDTH + GRID / 2 + 1e-9]
+# A deposited bead is stored by its centreline cells. The bead half width is added once,
+# in the collision test (as in the reference: material footprint = bead centreline + half width).
+STENCIL = [(0, 0)]
 
 
 def obstruction_radius(dz: float) -> float:
@@ -131,25 +129,27 @@ class Checker:
     def _cell(x: float, y: float) -> Tuple[int, int]:
         return (round(x / GRID), round(y / GRID))
 
-    def _deposit(self, x0: float, y0: float, x1: float, y1: float, z: float) -> None:
-        """Mark the cells covered by a bead from (x0, y0) to (x1, y1) at height z."""
+    def _deposit(self, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float) -> None:
+        """Mark the centreline cells of a bead from (x0, y0, z0) to (x1, y1, z1)."""
         length = math.hypot(x1 - x0, y1 - y0)
         n = max(1, int(math.ceil(length / (GRID / 2))))
-        path_cells = set()
+        heights = self.heights
+        top = -math.inf
         for k in range(n + 1):
             t = k / n
-            path_cells.add(self._cell(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
-        heights = self.heights
-        for cx, cy in path_cells:
-            if self.stamped.get((cx, cy), -math.inf) >= z:
-                continue                       # already stamped at this height or higher
-            self.stamped[(cx, cy)] = z
+            # Height of the bead at this point: the nozzle Z here, not the segment maximum.
+            zk = z0 + (z1 - z0) * t
+            cx, cy = self._cell(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+            if self.stamped.get((cx, cy), -math.inf) >= zk:
+                continue
+            self.stamped[(cx, cy)] = zk
             for dx, dy in STENCIL:
                 key = (cx + dx, cy + dy)
-                if z > heights.get(key, -math.inf):
-                    heights[key] = z
-        if path_cells and z > self.max_deposited_z:
-            self.max_deposited_z = z
+                if zk > heights.get(key, -math.inf):
+                    heights[key] = zk
+            top = max(top, zk)
+        if top > self.max_deposited_z:
+            self.max_deposited_z = top
 
     def _check_clearance(self, x: float, y: float, z: float, line: int) -> bool:
         """Nozzle at (x, y, z) against deposited material (tip and cone only). True if it collides."""
@@ -185,8 +185,10 @@ class Checker:
             self.report.z_min = z
         if self.report.z_max is None or z > self.report.z_max:
             self.report.z_max = z
+        # Negative Z is not an error by itself: Bambu firmware touches the nozzle on an exposed
+        # steel area below Z=0 for calibration. Extrusion below the bed is checked in _move.
         if z < -1e-6:
-            self._issue("error", "Z_NEGATIVE", line, f"Z={z:.3f} is below the bed")
+            self.report.count("z_below_bed_moves")
 
     # -- main loop --
     def run(self, lines) -> Report:
@@ -202,9 +204,9 @@ class Checker:
     def _line(self, raw: str, lineno: int) -> None:
         if ";" in raw:
             code, comment = raw.split(";", 1)
-            m = re.search(r"TYPE:(.*)", comment)
+            m = re.match(r"\s*TYPE:(.*)", comment)
             if m:
-                self.current_type = m.group(1).strip()
+                self.current_type = m.group(1).strip()[:40]
         else:
             code = raw
         code = re.sub(r"\([^)]*\)", "", code).strip()
@@ -216,8 +218,7 @@ class Checker:
             self._move(code, lineno)
         elif cmd in ("G2", "G02", "G3", "G03"):
             self.report.count("arc_moves")
-            self._issue("warning", "ARC", lineno, "arc move: not analysed by this checker")
-            self._update_position(code)
+            self._arc(code, cmd in ("G2", "G02"), lineno)
         elif cmd == "G90":
             self.abs_xyz = True
         elif cmd == "G91":
@@ -270,6 +271,63 @@ class Checker:
         if "E" in v:
             self.e_pos = v["E"] if self.abs_e else self.e_pos + v["E"]
 
+    def _arc(self, code: str, clockwise: bool, lineno: int) -> None:
+        """Split a G2/G3 arc into short chords and check each chord like a G1 move."""
+        v = self._values(code)
+        x0, y0, z0 = self.pos
+        e0 = self.e_pos
+        xe = v.get("X", x0) if self.abs_xyz else x0 + v.get("X", 0.0)
+        ye = v.get("Y", y0) if self.abs_xyz else y0 + v.get("Y", 0.0)
+        ze = v.get("Z", z0) if self.abs_xyz else z0 + v.get("Z", 0.0)
+        if "I" in v or "J" in v:
+            cx, cy = x0 + v.get("I", 0.0), y0 + v.get("J", 0.0)   # IJ offsets are always relative
+        elif "R" in v:
+            # R form: centre on the perpendicular bisector; positive R means the short arc.
+            mx, my = (x0 + xe) / 2, (y0 + ye) / 2
+            d = math.hypot(xe - x0, ye - y0)
+            h = math.sqrt(max(0.0, v["R"] ** 2 - (d / 2) ** 2))
+            ux, uy = (-(ye - y0) / d, (xe - x0) / d) if d > 1e-12 else (0.0, 0.0)
+            sign = -1.0 if clockwise else 1.0
+            if v["R"] < 0:
+                sign = -sign
+            cx, cy = mx + sign * ux * h, my + sign * uy * h
+        else:
+            self._issue("warning", "ARC", lineno, "arc without I/J/R: not analysed")
+            self.pos = [xe, ye, ze]
+            return
+        radius = math.hypot(x0 - cx, y0 - cy)
+        if radius < 1e-9:
+            self.pos = [xe, ye, ze]
+            return
+        a0 = math.atan2(y0 - cy, x0 - cx)
+        a1 = math.atan2(ye - cy, xe - cx)
+        if math.hypot(xe - x0, ye - y0) < 1e-9:
+            sweep = 2 * math.pi                         # full circle
+        elif clockwise:
+            sweep = (a0 - a1) % (2 * math.pi)
+        else:
+            sweep = (a1 - a0) % (2 * math.pi)
+        sign = -1.0 if clockwise else 1.0
+        n = max(1, int(math.ceil(radius * sweep / 0.2)))
+        if "E" in v:
+            ex_abs = v["E"] if self.abs_e else e0 + v["E"]
+        else:
+            ex_abs = None
+        p_prev = (x0, y0, z0, e0)
+        for k in range(1, n + 1):
+            t = k / n
+            ang = a0 + sign * sweep * t
+            x = cx + radius * math.cos(ang)
+            y = cy + radius * math.sin(ang)
+            z = z0 + (ze - z0) * t
+            e = e0 if ex_abs is None else e0 + (ex_abs - e0) * t
+            if k == n:
+                x, y, z = xe, ye, ze
+            self._segment(p_prev[0], p_prev[1], p_prev[2], p_prev[3], x, y, z, e, lineno)
+            p_prev = (x, y, z, e)
+        self.pos = [xe, ye, ze]
+        self.e_pos = ex_abs if ex_abs is not None else e0
+
     def _move(self, code: str, lineno: int) -> None:
         v = self._values(code)
         if "F" in v:
@@ -288,11 +346,14 @@ class Checker:
         e1 = e0
         if "E" in v:
             e1 = v["E"] if self.abs_e else e0 + v["E"]
-        self.pos = new
-        self.e_pos = e1
         if "Z" in v:
             self.z_known = True
-        x1, y1, z1 = new
+        self._segment(x0, y0, z0, e0, new[0], new[1], new[2], e1, lineno)
+
+    def _segment(self, x0, y0, z0, e0, x1, y1, z1, e1, lineno: int) -> None:
+        """One straight move from (x0, y0, z0, e0) to (x1, y1, z1, e1)."""
+        self.pos = [x1, y1, z1]
+        self.e_pos = e1
         self._track_z(z1, lineno)
         if not self.z_known:
             return
@@ -310,8 +371,11 @@ class Checker:
                 slope = abs(dz) / dxy
                 angle = math.degrees(math.atan(slope))
                 self.report.max_slope_deg = max(self.report.max_slope_deg, angle)
-                if slope > self.max_slope + 1e-12 and dxy >= 0.5:
-                    self._issue("error", "SLOPE", lineno,
+                # Extrusion slopes are errors in both directions. Travel is checked only when the
+                # nozzle goes DOWN (a Z-hop up is safe; collisions are checked separately).
+                if slope > self.max_slope + 1e-12 and dxy >= 0.5 and (extruding or dz < 0):
+                    level = "error" if extruding else "warning"
+                    self._issue(level, "SLOPE", lineno,
                                 f"{kind} move at {angle:.2f}deg (limit {self.max_angle_deg:g}deg), "
                                 f"dz={dz:.3f} over {dxy:.3f} mm, type '{self.current_type}'")
                 if extruding:
@@ -324,7 +388,9 @@ class Checker:
             if self._check_clearance(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, z0 + (z1 - z0) * t, lineno):
                 break   # one collision per move is enough to fail the check
         if extruding and dxy > 1e-9:
-            self._deposit(x0, y0, x1, y1, max(z0, z1))
+            self._deposit(x0, y0, z0, x1, y1, z1)
+        if extruding and min(z0, z1) < -1e-6:
+            self._issue("error", "Z_NEGATIVE", lineno, f"extrusion below the bed (Z={min(z0, z1):.3f})")
 
 
 def format_report(path: str, report: Report, max_angle: float) -> str:
